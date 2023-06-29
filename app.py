@@ -16,6 +16,7 @@ import torch
 from tools.painter import mask_painter
 import psutil
 import time
+from PIL import Image
 try: 
     from mmcv.cnn import ConvModule
 except:
@@ -284,6 +285,8 @@ def vos_tracking_video(video_state, interactive_state, mask_dropdown):
         print("save mask")
         for mask in video_state["masks"]:
             np.save(os.path.join('./result/mask/{}'.format(video_state["video_name"].split('.')[0]), '{:05d}.npy'.format(i)), mask)
+            img = Image.fromarray(mask * 255) # convert numpy array to image
+            img.save(os.path.join('./result/mask/{}'.format(video_state["video_name"].split('.')[0]), '{:05d}.png'.format(i)))  # save as .png or .jpg as you prefer
             i+=1
         # save_mask(video_state["masks"], video_state["video_name"])
     #### shanggao code for mask save
@@ -379,7 +382,7 @@ xmem_checkpoint = download_checkpoint(xmem_checkpoint_url, folder, xmem_checkpoi
 e2fgvi_checkpoint = download_checkpoint_from_google_drive(e2fgvi_checkpoint_id, folder, e2fgvi_checkpoint)
 args.port = 12212
 args.device = "cuda:0"
-# args.mask_save = True
+args.mask_save = True
 
 # initialize sam, xmem, e2fgvi models
 model = TrackingAnything(SAM_checkpoint, xmem_checkpoint, e2fgvi_checkpoint,args)
