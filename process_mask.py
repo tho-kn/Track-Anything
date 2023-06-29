@@ -2,6 +2,8 @@ import os
 import numpy as np
 from PIL import Image, ImageOps
 import shutil
+from tqdm import tqdm
+import cv2
 
 def resize_and_invert_and_merge_images_in_directory(directory, size=(3360, 3360), dilation_size=5):
     # Open the mask with which all images will be merged
@@ -9,8 +11,10 @@ def resize_and_invert_and_merge_images_in_directory(directory, size=(3360, 3360)
 
     for foldername in os.listdir(directory):
         subdir = os.path.join(directory, foldername)
+        print("Processing {}".format(foldername))
         if os.path.isdir(subdir):
-            for filename in os.listdir(subdir):
+            files = tqdm(os.listdir(subdir))
+            for filename in files:
                 if filename.endswith('.png'):  # adjust this if you have .jpg or other file types
                     img_path = os.path.join(subdir, filename)
                     
@@ -31,14 +35,8 @@ def resize_and_invert_and_merge_images_in_directory(directory, size=(3360, 3360)
                     img = np.minimum(img, merge_mask)
 
                     # Expand the masked area by dilation operation
-                    for _ in range(dilation_size):
-                        for channel in range(img.shape[2]):
-                            mask = img[:, :, channel] < 128  # create a mask for pixels with values less than 128 in each channel
-                            img[:, :, channel] = np.where(
-                                np.pad(mask, pad_width=1, mode='constant', constant_values=0)[1:-1,1:-1],  # shift the mask by 1 pixel to the left, up, right and down
-                                0,  # set the value to 0 where the shifted mask is True
-                                img[:, :, channel]  # keep the original value where the shifted mask is False
-                            )
+                    kernel = np.ones((dilation_size, dilation_size), dtype='uint8')
+                    img = cv2.erode(img, kernel)
 
                     # Convert back to Image and save
                     img = Image.fromarray(img.astype('uint8'))
