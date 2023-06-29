@@ -80,6 +80,14 @@ python app.py --device cuda:0
 # python app.py --device cuda:0 --sam_model_type vit_b # for lower memory usage
 ```
 
+## Process Masks
+```
+# Process masks in the result folder for the usage as COLMAP mask
+python process_mask.py
+# Select image folder to move mask files with new name for COLMAP image masking
+python match_mask_n_image.py
+```
+
 
 ## :book: Citation
 If you find this work useful for your research or applications, please cite using this BibTeX:
