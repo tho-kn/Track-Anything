@@ -17,10 +17,67 @@ from tools.painter import mask_painter
 import psutil
 import time
 from PIL import Image
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+import subprocess
 try: 
     from mmcv.cnn import ConvModule
 except:
     os.system("mim install mmcv")
+    
+    
+    import subprocess
+
+
+# Use ffmpeg to re-encode the video which will also fix the moov atom error.
+def fix_moov_atom_error(input_video_path, output_video_path):
+    try:
+        # Extract the video clip from the start to the end of the video.
+        # This will re-encode the video and fix the moov atom error.
+        ffmpeg_extract_subclip(input_video_path, 0, -1, targetname=output_video_path)
+        return True
+    except Exception as e:
+        print(f"Error in fixing moov atom error: {str(e)}")
+        return False
+        
+
+def check_moov_atom_error(video_path):
+    try:
+        # Run ffmpeg in a subprocess and capture the output.
+        result = subprocess.run(["ffmpeg", "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # Check if the output contains the "moov atom not found" error.
+        return "moov atom not found" in result.stdout.decode("utf-8")
+    except Exception as e:
+        print(f"Error in checking moov atom error: {str(e)}")
+        return False
+
+
+def preprocess_video(video_path):
+    if check_moov_atom_error(video_path):
+        fixed_video_path = "fixed_" + video_path
+        if fix_moov_atom_error(video_path, fixed_video_path):
+            video_path = fixed_video_path
+    
+    # Check the video's codec
+    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    codec = result.stdout.decode("utf-8").strip()
+
+    # If the codec is H.265, re-encode the video to H.264
+    if codec.lower() == "hevc":
+        # Split the path into the directory and the filename
+        dir_name, file_name = os.path.split(video_path)
+
+        # Add "h264_" to the start of the filename
+        new_file_name = "h264_" + file_name
+
+        # Combine the original directory with the new filename
+        output_video_path = os.path.join(dir_name, new_file_name)
+        subprocess.run(["ffmpeg", "-i", video_path, "-c:v", "libx264", "-crf", "23", output_video_path])
+        return output_video_path
+
+    # If the codec is not H.265, return the original video path
+    return video_path
+
+
 
 # download checkpoints
 def download_checkpoint(url, folder, filename):
@@ -70,9 +127,23 @@ def get_prompt(click_state, click_input):
     }
     return prompt
 
+# convert points input to prompt state
+def get_undo_prompt(click_state):
+    points = click_state[0][:-1]
+    labels = click_state[1][:-1]
+    click_state[0] = points
+    click_state[1] = labels
+    prompt = {
+        "prompt_type":["click"],
+        "input_point":click_state[0],
+        "input_label":click_state[1],
+        "multimask_output":"True",
+    }
+    return prompt
+
 
 # extract frames from upload video
-def get_frames_from_video(video_input, video_state):
+def get_frames_from_video(video_input, video_state, interactive_state):
     """
     Args:
         video_path:str
@@ -80,17 +151,47 @@ def get_frames_from_video(video_input, video_state):
     Return 
         [[0:nearest_frame], [nearest_frame:], nearest_frame]
     """
+    video_input = video_input.name
+    if video_input is None or len(video_input) == 0:
+        print("Video file is not provided!")
+        return
     video_path = video_input
+    video_path = preprocess_video(video_path)
     frames = []
     user_name = time.time()
     operation_log = [("",""),("Upload video already. Try click the image for adding targets to track and inpaint.","Normal")]
+    
+    resize_ratio = interactive_state["frame_resize_ratio"]
+    crop_square = interactive_state["crop_square"]
     try:
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        
+        target_width = width
+        target_height = height
+        crop_size = int(min(width, height))
+        
+        print("Crop Square: {}".format(crop_square))
+        print("Resize Ratio: {}".format(resize_ratio))
+        if crop_square:
+            target_width, target_height = crop_size, crop_size
+        target_width = int(target_width * resize_ratio)
+        target_height = int(target_height * resize_ratio)
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if ret == True:
                 current_memory_usage = psutil.virtual_memory().percent
+                
+                if crop_square:
+                    # Crop the frame to a square
+                    x = int((width - crop_size) // 2)
+                    y = int((height - crop_size) // 2)
+                    frame = frame[y:y+crop_size, x:x+crop_size]
+                if resize_ratio != 1.0:
+                    frame = cv2.resize(frame, (target_width, target_height))
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 if current_memory_usage > 90:
                     operation_log = [("Memory usage is too high (>90%). Stop the video extraction. Please reduce the video resolution or frame rate.", "Error")]
@@ -115,8 +216,8 @@ def get_frames_from_video(video_input, video_state):
     video_info = "Video Name: {}, FPS: {}, Total Frames: {}, Image Size:{}".format(video_state["video_name"], video_state["fps"], len(frames), image_size)
     model.samcontroler.sam_controler.reset_image() 
     model.samcontroler.sam_controler.set_image(video_state["origin_images"][0])
-    return video_state, video_info, video_state["origin_images"][0], gr.update(visible=True, maximum=len(frames), value=1), gr.update(visible=True, maximum=len(frames), value=len(frames)), \
-                        gr.update(visible=True),\
+    return video_state, video_path, video_info, video_state["origin_images"][0], gr.update(visible=True, maximum=len(frames), value=1), gr.update(visible=True, maximum=len(frames), value=len(frames)), \
+                        gr.update(visible=True), gr.update(visible=True), \
                         gr.update(visible=True), gr.update(visible=True), \
                         gr.update(visible=True), gr.update(visible=True), \
                         gr.update(visible=True), gr.update(visible=True), \
@@ -157,6 +258,15 @@ def get_end_number(track_pause_number_slider, video_state, interactive_state):
 def get_resize_ratio(resize_ratio_slider, interactive_state):
     interactive_state["resize_ratio"] = resize_ratio_slider
 
+    return interactive_state
+
+def get_frame_resize_ratio(resize_ratio_slider, interactive_state):
+    interactive_state["frame_resize_ratio"] = resize_ratio_slider
+
+    return interactive_state
+    
+def update_crop_square_state(crop_square, interactive_state):
+    interactive_state["crop_square"] = crop_square
     return interactive_state
 
 # use sam to get the mask
@@ -210,6 +320,45 @@ def clear_click(video_state, click_state):
     template_frame = video_state["origin_images"][video_state["select_frame_number"]]
     operation_log = [("",""), ("Clear points history and refresh the image.","Normal")]
     return template_frame, click_state, operation_log
+
+# use sam to get the mask
+def undo_click(video_state, point_prompt, click_state, interactive_state):
+    """
+    Args:
+        template_frame: PIL.Image
+        point_prompt: flag for positive or negative button click
+        click_state: [[points], [labels]]
+    """
+    if len(click_state[1]) > 0:
+        last_label = click_state[1][-1]
+        if last_label == 1:
+            interactive_state["positive_click_times"] -= 1
+        else:
+            interactive_state["negative_click_times"] -= 1
+        prompt = get_undo_prompt(click_state=click_state)
+        
+    if len(click_state[1]) == 0:
+        template_frame = video_state["origin_images"][video_state["select_frame_number"]]
+        operation_log = [("",""), ("Clear points history and refresh the image.","Normal")]
+        
+        return template_frame, video_state, interactive_state, operation_log
+    
+    # prompt for sam model
+    model.samcontroler.sam_controler.reset_image()
+    model.samcontroler.sam_controler.set_image(video_state["origin_images"][video_state["select_frame_number"]])
+
+    mask, logit, painted_image = model.first_frame_click( 
+                                                      image=video_state["origin_images"][video_state["select_frame_number"]], 
+                                                      points=np.array(prompt["input_point"]),
+                                                      labels=np.array(prompt["input_label"]),
+                                                      multimask=prompt["multimask_output"],
+                                                      )
+    video_state["masks"][video_state["select_frame_number"]] = mask
+    video_state["logits"][video_state["select_frame_number"]] = logit
+    video_state["painted_images"][video_state["select_frame_number"]] = painted_image
+
+    operation_log = [("",""), ("Use SAM for segment. You can try add positive and negative points by clicking. Or press Clear clicks button to refresh the image. Press Add mask button when you are satisfied with the segment","Normal")]
+    return painted_image, video_state, interactive_state, operation_log
 
 def remove_multi_mask(interactive_state, mask_dropdown):
     interactive_state["multi_mask"]["mask_names"]= []
@@ -408,7 +557,9 @@ with gr.Blocks() as iface:
             "masks": []
         },
         "track_end_number": None,
-        "resize_ratio": 1
+        "frame_resize_ratio": 1,
+        "resize_ratio": 1,
+        "crop_square": False,
     }
     )
 
@@ -431,13 +582,15 @@ with gr.Blocks() as iface:
 
         # for user video input
         with gr.Column():
-            with gr.Row(scale=0.4):
-                video_input = gr.Video(autosize=True)
+            with gr.Row():
+                with gr.Column():
+                    video_input = gr.File()
+                    video_preview = gr.Video(interactive=False, include_audio=False)
                 with gr.Column():
                     video_info = gr.Textbox(label="Video Info")
                     resize_info = gr.Textbox(value="If you want to use the inpaint function, it is best to git clone the repo and use a machine with more VRAM locally. \
                                             Alternatively, you can use the resize ratio slider to scale down the original image to around 360P resolution for faster processing.", label="Tips for running this demo.")
-                    resize_ratio_slider = gr.Slider(minimum=0.02, maximum=1, step=0.02, value=1, label="Resize ratio", visible=True)
+                    resize_ratio_slider = gr.Slider(minimum=0.02, maximum=1, step=0.02, value=1, label="Inpaint Resize ratio", visible=True)
           
 
             with gr.Row():
@@ -445,7 +598,10 @@ with gr.Blocks() as iface:
                 with gr.Column():
                     # extract frames
                     with gr.Column():
-                        extract_frames_button = gr.Button(value="Get video info", interactive=True, variant="primary") 
+                        with gr.Row():
+                            frame_resize_ratio_slider = gr.Slider(minimum=0.02, maximum=1, step=0.02, value=1, label="Video Resize ratio", visible=True)
+                            crop_square_checkbox = gr.Checkbox(label="Crop to Square Frame (For fisheye video)")
+                        extract_frames_button = gr.Button(value="Get video info", interactive=True, variant="primary")
 
                      # click points settins, negative or positive, mode continuous or single
                     with gr.Row():
@@ -457,6 +613,7 @@ with gr.Blocks() as iface:
                                 interactive=True,
                                 visible=False)
                             remove_mask_button = gr.Button(value="Remove mask", interactive=True, visible=False) 
+                            undo_button_click = gr.Button(value="Undo clicks", interactive=True, visible=False) 
                             clear_button_click = gr.Button(value="Clear clicks", interactive=True, visible=False).style(height=160)
                             Add_mask_button = gr.Button(value="Add mask", interactive=True, visible=False)
                     template_frame = gr.Image(type="pil",interactive=True, elem_id="template_frame", visible=False).style(height=360)
@@ -475,12 +632,12 @@ with gr.Blocks() as iface:
     extract_frames_button.click(
         fn=get_frames_from_video,
         inputs=[
-            video_input, video_state
+            video_input, video_state, interactive_state
         ],
-        outputs=[video_state, video_info, template_frame,
-                 image_selection_slider, track_pause_number_slider,point_prompt, clear_button_click, Add_mask_button, template_frame,
+        outputs=[video_state, video_preview, video_info, template_frame,
+                 image_selection_slider, track_pause_number_slider,point_prompt, undo_button_click, clear_button_click, Add_mask_button, template_frame,
                  tracking_video_predict_button, video_output, mask_dropdown, remove_mask_button, inpaint_video_predict_button, run_status]
-    )   
+    )
 
     # second step: select images from slider
     image_selection_slider.release(fn=select_template, 
@@ -492,6 +649,12 @@ with gr.Blocks() as iface:
     resize_ratio_slider.release(fn=get_resize_ratio, 
                                    inputs=[resize_ratio_slider, interactive_state], 
                                    outputs=[interactive_state], api_name="resize_ratio")
+    frame_resize_ratio_slider.release(fn=get_frame_resize_ratio, 
+                                   inputs=[frame_resize_ratio_slider, interactive_state], 
+                                   outputs=[interactive_state], api_name="frame_resize_ratio")
+    crop_square_checkbox.change(fn=update_crop_square_state, api_name="crop_square",
+                                   inputs=[crop_square_checkbox, interactive_state], 
+                                   outputs=[interactive_state])
     
     # click select image to get mask using sam
     template_frame.select(
@@ -563,7 +726,7 @@ with gr.Blocks() as iface:
         [[],[]],
         None,
         None,
-        gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
+        gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), \
         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=[]), gr.update(visible=False), \
         gr.update(visible=False), gr.update(visible=False)
@@ -576,7 +739,7 @@ with gr.Blocks() as iface:
             click_state,
             video_output,
             template_frame,
-            tracking_video_predict_button, image_selection_slider , track_pause_number_slider,point_prompt, clear_button_click, 
+            tracking_video_predict_button, image_selection_slider , track_pause_number_slider,point_prompt, undo_button_click, clear_button_click, 
             Add_mask_button, template_frame, tracking_video_predict_button, video_output, mask_dropdown, remove_mask_button,inpaint_video_predict_button, run_status
         ],
         queue=False,
@@ -588,6 +751,12 @@ with gr.Blocks() as iface:
         inputs = [video_state, click_state,],
         outputs = [template_frame,click_state, run_status],
     )
+    undo_button_click.click(
+        fn = undo_click,
+        inputs = [video_state, point_prompt, click_state, interactive_state,],
+        outputs=[template_frame, video_state, interactive_state, run_status]
+    )
+
     # set example
     gr.Markdown("##  Examples")
     gr.Examples(
